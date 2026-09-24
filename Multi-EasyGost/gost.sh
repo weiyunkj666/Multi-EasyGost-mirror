@@ -18,18 +18,110 @@ for _ghcn in \
     "${XDG_CONFIG_HOME:-$HOME/.config}/ghcn/ghcn.sh" \
     "/usr/local/lib/ghcn.sh"; do
   if [ -f "$_ghcn" ]; then
-    if . "$_ghcn" >/dev/null 2>&1 && command -v ghcn_resolve >/dev/null 2>&1; then
-      GHCN_PROXY="$(ghcn_resolve 2>/dev/null)"
+    if . "$_ghcn" >/dev/null 2>&1 && command -v ghcn_peek >/dev/null 2>&1; then
+      # 这里只读配置/缓存，不联网、不测速 —— 脚本启动必须秒开，
+      # 测速留到用户点了「安装」之后再让他自己决定
+      GHCN_PROXY="$(ghcn_peek 2>/dev/null)"
     fi
     break
   fi
 done
 unset _ghcn
 
-# 兜底：什么都没取到时用空串（= 直连 GitHub）。
-# 注意这一行必须放在 source ghcn.sh 之后：ghcn_resolve 是靠"变量是否已定义"来判断
-# 用户有没有显式指定的，如果提前把 GHCN_PROXY 定义成空串，它就会误判成
-# "用户要求直连"，从而完全忽略 ghcn.sh 里选好的反代。
+# ---------------------------------------------------------------------------
+# 国内 GitHub 反代 —— 内置兜底版
+#   为什么需要它：很多人是用"一键命令"只 wget 了本脚本这一个文件，同目录下
+#   并没有 ghcn.sh，于是反代永远取不到、静默走直连（实测踩过这个坑：
+#   直连下 5MB 只有 24KB/s，卡了将近 3 分钟）。
+#   所以这里内置一份最小可用实现：反代清单 + 选择器 + 下载器（IPv4 优先）。
+#   如果上面已经 source 到完整的 ghcn.sh，它的同名函数优先，这份不会生效。
+#   注意：下面的清单要与 ghcn.sh 的 GHCN_URLS 保持同步，改一处记得也改另一处。
+# ---------------------------------------------------------------------------
+if ! command -v ghcn_choose >/dev/null 2>&1; then
+  GHCN_URLS=(
+    "https://gh-proxy.com/"       "https://gh.llkk.cc/"
+    "https://ghfast.top/"         "https://gh.monlor.com/"
+    "https://ghproxy.net/"        "https://gh.xxooo.cf/"
+    "https://gh.chjina.com/"      "https://gh.ddlc.top/"
+    "https://ghproxy.cxkpro.top/" "https://gh.jasonzeng.dev/"
+    "https://ghproxy.imciel.com/" "https://ghfile.geekertao.top/"
+  )
+  GHCN_CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ghcn/config"
+
+  ghcn_peek() {
+    if [ ! -f "$GHCN_CONF_FILE" ]; then printf '\n'; return 0; fi
+    local mode m
+    mode="$(sed -n 's/^MODE=//p' "$GHCN_CONF_FILE" 2>/dev/null | head -1)"
+    m="$(sed -n 's/^MIRROR=//p' "$GHCN_CONF_FILE" 2>/dev/null | head -1)"
+    if [ "$mode" = "fixed" ]; then printf '%s\n' "$m"; else printf '\n'; fi
+  }
+
+  ghcn_choose() {
+    local i=0 n=${#GHCN_URLS[@]} choice cur picked
+    if [ -n "${GHCN_PROXY:-}" ]; then
+      echo "  沿用已选定的加速地址：$GHCN_PROXY" >&2
+      printf '%s\n' "$GHCN_PROXY"; return 0
+    fi
+    if [ ! -t 0 ]; then ghcn_peek; return 0; fi
+    cur="$(ghcn_peek)"
+    {
+      printf '\n请选择用哪个加速地址来%s：\n' "${1:-下载}"
+      printf '    %-4s %-40s %s\n' "编号" "地址" "说明"
+      printf '    %-4s %-40s %s\n' "0" "直连 GitHub（不使用反代）" "服务器能直连时选它"
+      while [ "$i" -lt "$n" ]; do
+        if [ "${GHCN_URLS[$i]}" = "$cur" ]; then
+          printf '    %-4s %-40s <= 上次用的\n' "$((i + 1))" "${GHCN_URLS[$i]}"
+        else
+          printf '    %-4s %-40s\n' "$((i + 1))" "${GHCN_URLS[$i]}"
+        fi
+        i=$((i + 1))
+      done
+      printf '\n请输入编号（直接回车 = 1，输 0 = 直连）: '
+    } >&2
+    read -r choice
+    case "$choice" in
+      "")       picked="${GHCN_URLS[0]}" ;;
+      0)        picked="" ;;
+      *[!0-9]*) picked="${GHCN_URLS[0]}" ;;
+      *)        if [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+                  picked="${GHCN_URLS[$((choice - 1))]}"
+                else
+                  picked="${GHCN_URLS[0]}"
+                fi ;;
+    esac
+    if [ -n "$picked" ]; then echo "  → 已选：$picked" >&2; else echo "  → 已选：直连 GitHub" >&2; fi
+    mkdir -p "$(dirname "$GHCN_CONF_FILE")" 2>/dev/null || true
+    if [ -n "$picked" ]; then
+      { echo "MODE=fixed"; echo "MIRROR=$picked"; } > "$GHCN_CONF_FILE" 2>/dev/null || true
+    else
+      { echo "MODE=direct"; echo "MIRROR="; } > "$GHCN_CONF_FILE" 2>/dev/null || true
+    fi
+    printf '%s\n' "$picked"
+  }
+
+  ghcn_download() {
+    local url="$1" out="${2:-$(basename "$1")}"
+    if command -v curl >/dev/null 2>&1; then
+      curl -kfL -4 --retry 2 --connect-timeout 10 --max-time 900 --progress-bar -o "$out" "$url" && [ -s "$out" ]
+    elif command -v wget >/dev/null 2>&1; then
+      wget --no-check-certificate -4 --show-progress -T 30 -t 2 -O "$out" "$url" && [ -s "$out" ]
+    else
+      echo "需要 curl 或 wget，请先安装" >&2; return 1
+    fi
+  }
+fi
+
+# 读一下上次选过的反代（即使没有 ghcn.sh 也照样生效）
+if [ -z "${GHCN_PROXY:-}" ]; then
+  if _ghcn_saved="$(ghcn_peek 2>/dev/null)"; then
+    if [ -n "$_ghcn_saved" ]; then GHCN_PROXY="$_ghcn_saved"; fi
+  fi
+  unset _ghcn_saved 2>/dev/null || true
+fi
+
+# 兜底：什么都没取到时用空串。
+# 空串的含义是"用户还没明确选过反代"，所以安装时会弹清单让用户挑；
+# 非交互场景（GHCN_NO_PROMPT=1，或 stdin 不是终端）下，空串就等于直连 GitHub。
 GHCN_PROXY="${GHCN_PROXY:-}"
 
 # 自更新地址：默认留空 = 禁用自动覆盖（保护本文件里的反代补丁）
@@ -126,8 +218,12 @@ function Install_ct() {
   check_file
   check_sys
   # check_new_ver
-  echo -e "即将从 GitHub 下载 gost ${ct_new_ver}，当前加速地址：${GHCN_PROXY:-直连 GitHub}"
-  echo -e "（下载失败会自动依次尝试其他国内反代）"
+  # 先让用户自己挑用哪个反代来下载（不偷偷跑测速，也不默认悄悄走直连）
+  if command -v ghcn_choose >/dev/null 2>&1; then
+    GHCN_PROXY="$(ghcn_choose "下载 gost ${ct_new_ver}（约 5MB）")"
+  fi
+  echo -e "即将从 GitHub 下载 gost ${ct_new_ver}，使用的加速地址：${GHCN_PROXY:-直连 GitHub}"
+  echo -e "（下载失败会自动换其他国内反代重试；如果卡住不动，按 Ctrl+C 中断后重来、换一个反代）"
   rm -rf gost-linux-"$bit"-"$ct_new_ver".gz
   if command -v ghcn_download >/dev/null 2>&1; then
     ghcn_download "https://github.com/ginuerzh/gost/releases/download/v${ct_new_ver}/gost-linux-${bit}-${ct_new_ver}.gz" "gost-linux-${bit}-${ct_new_ver}.gz"

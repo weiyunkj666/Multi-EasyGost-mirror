@@ -15,14 +15,15 @@
 * 启动脚本（国内服务器推荐走反代前缀，直连 GitHub 往往很慢甚至超时）
 
   ```bash
-  # 推荐：从你自己的仓库/本压缩包里取（最快、最稳）
-  cd Multi-EasyGost-mirror/Multi-EasyGost && chmod +x gost.sh && ./gost.sh
-
-  # 或者从原仓库拉，加上国内反代前缀：
+  # 一键安装：只下这一个脚本就能跑（脚本内置了 12 个国内反代，运行时可自选）
   wget --no-check-certificate -O gost.sh \
     https://ghfast.top/https://raw.githubusercontent.com/weiyunkj666/Multi-EasyGost-mirror/main/Multi-EasyGost/gost.sh && \
-    cd Multi-EasyGost-mirror/Multi-EasyGost && chmod +x gost.sh && ./gost.sh
+    chmod +x gost.sh && ./gost.sh
   ```
+
+  > **不需要 git clone，也不用提前准备别的文件** —— 反代清单就内置在 gost.sh 里。
+  > 启动后会列出 12 个国内反代让你选一个来下载 gost 二进制，选择会被记住、下次沿用。
+  > 想换一个：把 `~/.config/ghcn/config` 删掉再跑一次即可。
 
 * 再次运行本脚本只需要输入`./gost.sh`回车即可
 

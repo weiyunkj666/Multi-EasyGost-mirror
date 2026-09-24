@@ -169,11 +169,9 @@ if [ -f "Multi-EasyGost/README.md" ]; then
   sub "Multi-EasyGost/README.md" \
       "https://ghfast.top/https://raw.githubusercontent.com/KANIKIG/Multi-EasyGost/master/gost.sh" \
       "https://ghfast.top/$GOST_RAW_PREFIX/gost.sh"
-  if [ "$FLAT_GOST" = "1" ]; then
-    sub "Multi-EasyGost/README.md" "chmod +x gost.sh && ./gost.sh" "chmod +x gost.sh && ./gost.sh"
-  else
-    sub "Multi-EasyGost/README.md" "chmod +x gost.sh && ./gost.sh" "cd $REPO_NAME/Multi-EasyGost && chmod +x gost.sh && ./gost.sh"
-  fi
+  # 注意：这里刻意不往一键命令里塞 cd。
+  # 用户常常是"只 wget 了脚本、并没有 clone 整个仓库"，
+  # 塞了 cd 就会 No such file or directory，后面的 && 全断掉（实测踩过这个坑）。
 fi
 
 # ---------- 4. gost.sh 里的 SELF_REPO_RAW ----------

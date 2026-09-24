@@ -65,12 +65,23 @@ GHCN_NOTES=(
 # 直连（不用任何反代）—— 对应菜单里的第 0 号
 GHCN_DIRECT=""
 
-# 测速用的目标文件（随便一个 20KB 左右的小文件即可，越小测速越快）
-GHCN_TEST_URL="${GHCN_TEST_URL:-https://github.com/KANIKIG/Multi-EasyGost/archive/refs/heads/v2.zip}"
-# 校验阈值：下载字节数大于这个值才算反代真的可用（避免把错误页当成成功）
-GHCN_TEST_MIN="${GHCN_TEST_MIN:-10000}"
-# 单个反代测速超时（秒）
+# ---------------------------------------------------------------------------
+# 测速用什么文件、量什么指标
+#   踩过的坑：原来用 20KB 小文件比"耗时"，那只量到延迟、量不到吞吐 ——
+#   直连下 20KB 不到 1 秒（看着最快），真去下 5MB 时只有 24KB/s，花了 2 分 53 秒。
+#   现在改成：限时下载一个真实的大文件，比"固定时间内谁拉到的字节多"（吞吐量）。
+# ---------------------------------------------------------------------------
+GHCN_TEST_URL="${GHCN_TEST_URL:-https://github.com/ginuerzh/gost/releases/download/v2.11.2/gost-linux-amd64-2.11.2.gz}"
+# 每个地址最多下多少秒（这段时间里拉到的字节数就是它的吞吐量）
+GHCN_PROBE_TIME="${GHCN_PROBE_TIME:-6}"
+# 至少拉到这么多字节才算这个地址可用（避免把错误页或几乎不通的当成可用）
+GHCN_TEST_MIN="${GHCN_TEST_MIN:-100000}"
+# 兼容旧变量名：GHCN_TIMEOUT 仍然接受
 GHCN_TIMEOUT="${GHCN_TIMEOUT:-10}"
+# 优先用 IPv4。raw.githubusercontent.com 的 IPv6 在国内经常是黑洞，
+# wget/curl 会卡在 "HTTP request sent, awaiting response..." 再也不返回。
+# 1=优先 IPv4（连不上会自动放开重试）；0=不特殊处理
+GHCN_IPV4="${GHCN_IPV4:-1}"
 # HTTPS 证书校验开关：1=跳过校验（默认，兼容证书库过旧的老服务器，与原项目 wget --no-check-certificate 行为一致）
 #                    0=严格校验
 GHCN_INSECURE="${GHCN_INSECURE:-1}"
@@ -131,7 +142,8 @@ ghcn_config_load() {
 }
 
 ghcn_config_save() {
-  mkdir -p "$GHCN_DIR" 2>/dev/null || { ghcn_err "无法创建配置目录 $GHCN_DIR"; return 1; }
+  # 配置目录建不出来不算致命：警告一下继续，否则调用方脚本开了 set -e 会被直接带崩
+  mkdir -p "$GHCN_DIR" 2>/dev/null || { ghcn_warn "无法创建配置目录 $GHCN_DIR（本次选择不会被记住）"; return 0; }
   {
     echo "# ghcn.sh 配置文件 —— 由 ./ghcn.sh use <编号> 等命令自动生成"
     echo "# MODE 可选: auto(自动测速) / fixed(固定某个) / direct(直连)"
@@ -141,25 +153,32 @@ ghcn_config_save() {
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# 5. 网络探测：返回 "状态码 字节数 耗时秒"
-# ---------------------------------------------------------------------------
+ghcn__curl_probe() {
+  # $1 = url，$2 = 额外 curl 参数（可为空串）
+  local url="$1" extra="${2:-}" insecure=""
+  [ "${GHCN_INSECURE:-1}" = "1" ] && insecure="-k"
+  # shellcheck disable=SC2086
+  curl -s $insecure -L $extra --max-time "$GHCN_PROBE_TIME" -o /dev/null \
+       -w '%{http_code} %{size_download} %{time_total}' "$url" 2>/dev/null
+}
+
 ghcn_probe() {
-  # 用法: ghcn_probe <前缀> <完整URL>
-  local prefix="$1" url="$2"
-  if ! ghcn_has curl; then
-    ghcn_err "测速需要 curl，请先安装：apt install -y curl  或  yum install -y curl"
-    return 1
-  fi
-  if [ "${GHCN_INSECURE:-1}" = "1" ]; then
-    curl -ksL --max-time "$GHCN_TIMEOUT" -o /dev/null \
-         -w '%{http_code} %{size_download} %{time_total}' \
-         "${prefix}${url}" 2>/dev/null
+  # 用法: ghcn_probe <前缀>
+  # 输出: "状态码 下载字节数 耗时秒 字节每秒"
+  # 关键：量的是"固定时间内下了多少字节"（吞吐量），不是"下完一个小文件花了几秒"（延迟）。
+  # 用 20KB 小文件测延迟会把直连选成"最快"，结果真下 5MB 时只有 24KB/s —— 这个坑实测踩过。
+  local prefix="$1" url r
+  ghcn_has curl || { ghcn_err "测速需要 curl，请先安装：apt install -y curl  或  yum install -y curl"; return 1; }
+  url="${prefix}${GHCN_TEST_URL}"
+  if [ "${GHCN_IPV4:-1}" = "1" ]; then
+    r="$(ghcn__curl_probe "$url" "-4")"
+    case "$r" in
+      "000 "*|""|"000") r="$(ghcn__curl_probe "$url" "")" ;;   # IPv4 连不上就放开地址族重试
+    esac
   else
-    curl -sL --max-time "$GHCN_TIMEOUT" -o /dev/null \
-         -w '%{http_code} %{size_download} %{time_total}' \
-         "${prefix}${url}" 2>/dev/null
+    r="$(ghcn__curl_probe "$url" "")"
   fi
+  printf '%s %s\n' "$r" "$(ghcn_bps "$r")"
 }
 
 # 判断一次探测结果是否算"可用"
@@ -179,53 +198,139 @@ ghcn_probe_ok() {
 # ---------------------------------------------------------------------------
 ghcn_speedtest() {
   local quiet="${1:-}"
-  local best_prefix="" best_time="" i n prefix result cur_time count=0
+  local best_prefix="" best_bps=0 i=-1 n prefix label result bps
 
-  [ "$quiet" = "quiet" ] || ghcn_msg "开始实测反代速度（每个最多 ${GHCN_TIMEOUT}s，目标文件约 20KB）..."
-
-  # 先测直连，作为"反代到底有没有用"的参照
-  result="$(ghcn_probe "$GHCN_DIRECT" "$GHCN_TEST_URL")"
-  if ghcn_probe_ok "$result"; then
-    best_time="$(printf '%s' "$result" | awk '{print $3}')"
-    [ "$quiet" = "quiet" ] || printf '  %-34s %s✔%s  %ss\n' "直连 GitHub" "$(ghcn_color green)" "$(ghcn_color off)" "$best_time" >&2
-  else
-    best_time=""
-    [ "$quiet" = "quiet" ] || printf '  %-34s %s✘%s  (%s)\n' "直连 GitHub" "$(ghcn_color red)" "$(ghcn_color off)" "$result" >&2
-  fi
+  [ "$quiet" = "quiet" ] || ghcn_msg "开始实测吞吐量：每个地址限时 ${GHCN_PROBE_TIME}s，比谁在这段时间里拉到的字节多（这才代表真实下载速度）"
 
   n=${#GHCN_URLS[@]}
-  i=0
   while [ "$i" -lt "$n" ]; do
-    prefix="${GHCN_URLS[$i]}"
-    result="$(ghcn_probe "$prefix" "$GHCN_TEST_URL")"
+    if [ "$i" -lt 0 ]; then
+      prefix="$GHCN_DIRECT"; label="直连 GitHub"
+    else
+      prefix="${GHCN_URLS[$i]}"; label="$prefix"
+    fi
+    result="$(ghcn_probe "$prefix")"
     if ghcn_probe_ok "$result"; then
-      count=$((count + 1))
-      cur_time="$(printf '%s' "$result" | awk '{print $3}')"
-      if [ -z "$best_time" ] || awk -v a="$cur_time" -v b="$best_time" 'BEGIN{exit !(a+0 < b+0)}'; then
-        best_time="$cur_time"
+      bps="$(printf '%s' "$result" | awk '{print $4 + 0}')"
+      [ "${bps:-0}" -gt 0 ] || bps=0
+      [ "$quiet" = "quiet" ] || printf '  %-38s %s%-10s%s\n' "$label" "$(ghcn_color green)" "$(ghcn_human "$bps")" "$(ghcn_color off)" >&2
+      if [ "$bps" -gt "$best_bps" ]; then
+        best_bps="$bps"
         best_prefix="$prefix"
       fi
-      [ "$quiet" = "quiet" ] || printf '  %-34s %s✔%s  %ss\n' "$prefix" "$(ghcn_color green)" "$(ghcn_color off)" "$cur_time" >&2
     else
-      [ "$quiet" = "quiet" ] || printf '  %-34s %s✘%s  (%s)\n' "$prefix" "$(ghcn_color red)" "$(ghcn_color off)" "$result" >&2
+      [ "$quiet" = "quiet" ] || printf '  %-38s %s%s%s\n' "$label" "$(ghcn_color red)" "不通 / 太慢" "$(ghcn_color off)" >&2
     fi
     i=$((i + 1))
   done
 
-  if [ -z "$best_time" ]; then
-    ghcn_warn "所有反代和直连都测不通，稍后再试，或检查服务器网络/DNS。"
+  if [ "${best_bps:-0}" -le 0 ]; then
+    ghcn_warn "所有地址都没测通（或都慢到拉不到 ${GHCN_TEST_MIN} 字节），建议手动指定一个反代。"
     printf '%s\n' "$GHCN_DIRECT"
     return 1
   fi
-
   if [ -z "$best_prefix" ]; then
-    ghcn_msg "直连就是最快的（本机到 GitHub 通），继续用直连。"
+    ghcn_msg "最快的是：直连 GitHub   $(ghcn_human "$best_bps")"
   else
-    ghcn_msg "最快的是：$best_prefix  用时 ${best_time}s"
+    ghcn_msg "最快的是：$best_prefix   $(ghcn_human "$best_bps")"
   fi
   printf '%s\n' "$best_prefix"
 }
 
+# ---------------------------------------------------------------------------
+# 6.6 吞吐量格式化
+# ---------------------------------------------------------------------------
+ghcn_bps() {
+  # $1 = "状态码 字节 耗时" -> 打印整数 字节/秒
+  printf '%s' "$1" | awk '{ t = $3 + 0; if (t <= 0) t = 0.001; printf "%d", ($2 + 0) / t }'
+}
+
+ghcn_human() {
+  # $1 = 字节/秒 -> 人类可读
+  awk -v b="${1:-0}" 'BEGIN{
+    if (b >= 1048576)   printf "%.2f MB/s", b / 1048576;
+    else if (b >= 1024) printf "%.0f KB/s", b / 1024;
+    else                printf "%.0f B/s",  b;
+  }'
+}
+
+# ---------------------------------------------------------------------------
+# 6.7 让用户自己选反代（安装脚本里用这个，而不是偷偷自动测速）
+#     为什么要交互：自动测速要等几十秒，而且"测速快"和"现在真能用"经常不是一回事。
+#     把清单摊开、让用户自己点，最不容易出意外；直接回车才是自动测速。
+# ---------------------------------------------------------------------------
+ghcn_choose() {
+  # 用法: prefix="$(ghcn_choose "用途说明")"
+  # 输出: 选中的反代前缀（选直连时是空行）
+  local purpose="${1:-下载}"
+  local i=0 n=${#GHCN_URLS[@]} choice cur mark picked
+
+  # 1) 已经有明确的反代（环境变量指定，或上次选过并记住了）→ 直接用，不重复问。
+  #    注意这里判断的是"非空"，不是"变量是否已定义"：变量被定义成空串时必须继续
+  #    往下弹菜单，否则就会重演"反代一直是空的、静默走直连"的老问题。
+  #    想每次安装都重新问一遍：GHCN_ALWAYS_ASK=1
+  if [ -n "${GHCN_PROXY:-}" ] && [ "${GHCN_ALWAYS_ASK:-0}" != "1" ]; then
+    ghcn_msg "沿用已选定的加速地址：$GHCN_PROXY"
+    ghcn_msg "（想换一个：运行 ./ghcn.sh 重新选择，或临时用 GHCN_PROXY=<地址> 跑本脚本）"
+    printf '%s\n' "$GHCN_PROXY"; return 0
+  fi
+  # 2) 非交互环境（管道 / 定时任务 / CI）自动退回按配置解析
+  if [ "${GHCN_NO_PROMPT:-0}" = "1" ] || [ ! -t 0 ]; then
+    ghcn_resolve; return 0
+  fi
+
+  ghcn_config_load
+  cur="$(ghcn_peek)"
+
+  # 菜单写到 stderr：这样 $(ghcn_choose) 的 stdout 只含"选中的前缀"这一个值
+  {
+    printf '\n%s请选择用哪个加速地址来%s：%s\n' "$(ghcn_color bold)" "$purpose" "$(ghcn_color off)"
+    printf '    %-4s %-38s %s\n' "编号" "地址" "说明"
+    printf '    %-4s %-38s %s\n' "0" "直连 GitHub（不使用反代）" "服务器能直连时选它"
+    while [ "$i" -lt "$n" ]; do
+      mark=""
+      [ "${GHCN_URLS[$i]}" = "$cur" ] && mark="   <= 上次用的"
+      printf '    %-4s %-38s %s%s\n' "$((i + 1))" "${GHCN_URLS[$i]}" "${GHCN_NOTES[$i]}" "$mark"
+      i=$((i + 1))
+    done
+    printf '    %-4s %-38s %s\n' "A" "自动测速（比吞吐量，最准）" "约 $(( (n + 1) * GHCN_PROBE_TIME )) 秒"
+    printf '    %-4s %-38s %s\n' "S" "跳过，沿用上次的设置" "${cur:-（当前：直连）}"
+    printf '\n请输入编号或字母 [直接回车 = A 自动测速]: '
+  } >&2
+
+  read -r choice
+  case "$choice" in
+    ""|a|A)
+      picked="$(ghcn_speedtest)" || picked=""
+      GHCN_MODE="fixed"; GHCN_MIRROR="$picked"; ghcn_config_save
+      ;;
+    s|S)
+      picked="$cur"
+      ;;
+    0)
+      picked=""
+      GHCN_MODE="direct"; GHCN_MIRROR=""; ghcn_config_save
+      ghcn_msg "已选：直连 GitHub（不使用反代）"
+      ;;
+    *[!0-9]*)
+      ghcn_warn "输入无效（$choice），改用自动测速"
+      picked="$(ghcn_speedtest)" || picked=""
+      GHCN_MODE="fixed"; GHCN_MIRROR="$picked"; ghcn_config_save
+      ;;
+    *)
+      if [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+        picked="${GHCN_URLS[$((choice - 1))]}"
+        GHCN_MODE="fixed"; GHCN_MIRROR="$picked"; ghcn_config_save
+        ghcn_msg "已选：$picked"
+      else
+        ghcn_warn "编号 $choice 超出范围，改用自动测速"
+        picked="$(ghcn_speedtest)" || picked=""
+        GHCN_MODE="fixed"; GHCN_MIRROR="$picked"; ghcn_config_save
+      fi
+      ;;
+  esac
+  printf '%s\n' "$picked"
+}
 # ---------------------------------------------------------------------------
 # 6.5 缓存有效性校验
 #     缓存是 ghcn_resolve 用来"跳过下次测速"的快捷路径，但它只是个普通文本文件，
@@ -339,23 +444,42 @@ ghcn_download() {
 ghcn__fetch() {
   # 内部：用 curl 或 wget 下载，成功返回 0
   # 注意：curl 没有 --no-check-certificate 这个参数（那是 wget 的），跳过校验要用 -k
-  local full="$1" out="$2"
+  local full="$1" out="$2" insecure="" ipv4=""
+  [ "${GHCN_INSECURE:-1}" = "1" ] && insecure="-k"
+  [ "${GHCN_IPV4:-1}" = "1" ] && ipv4="-4"
+
   if ghcn_has curl; then
-    if [ "${GHCN_INSECURE:-1}" = "1" ]; then
-      curl -kfL --retry 2 --connect-timeout 10 --max-time 600 --progress-bar -o "$out" "$full" && [ -s "$out" ]
-    else
-      curl -fL --retry 2 --connect-timeout 10 --max-time 600 --progress-bar -o "$out" "$full" && [ -s "$out" ]
+    # 先按 IPv4 下载（raw.githubusercontent.com 的 IPv6 在国内经常是黑洞，
+    # 会卡在 "HTTP request sent, awaiting response..." 再也不返回）
+    # shellcheck disable=SC2086
+    curl -s $insecure $ipv4 -fL --retry 2 --connect-timeout 10 --max-time 900 \
+         --progress-bar -o "$out" "$full" && [ -s "$out" ] && return 0
+    if [ -n "$ipv4" ]; then
+      ghcn_warn "IPv4 没连上，放开地址族再试一次……"
+      # shellcheck disable=SC2086
+      curl -s $insecure -fL --retry 2 --connect-timeout 10 --max-time 900 \
+           --progress-bar -o "$out" "$full" && [ -s "$out" ] && return 0
     fi
+    return 1
   elif ghcn_has wget; then
-    if [ "${GHCN_INSECURE:-1}" = "1" ]; then
-      wget -q --show-progress --no-check-certificate --timeout=30 --tries=2 -O "$out" "$full" && [ -s "$out" ]
-    else
-      wget -q --show-progress --timeout=30 --tries=2 -O "$out" "$full" && [ -s "$out" ]
+    if [ -n "$ipv4" ]; then
+      # shellcheck disable=SC2086
+      wget -q $insecure -4 --show-progress --timeout=30 --tries=2 -O "$out" "$full" && [ -s "$out" ] && return 0
+      ghcn_warn "IPv4 没连上，放开地址族再试一次……"
     fi
+    # shellcheck disable=SC2086
+    wget -q $insecure --show-progress --timeout=30 --tries=2 -O "$out" "$full" && [ -s "$out" ] && return 0
+    return 1
   else
     ghcn_err "需要 curl 或 wget，请先安装。"
     return 1
   fi
+}
+
+# 公开版下载函数，给项目脚本直接调用（已带反代前缀、IPv4 优先、失败自动换镜像）
+ghcn_fetch() {
+  # 用法: ghcn_fetch <完整URL> <输出文件>
+  ghcn__fetch "$1" "$2"
 }
 
 ghcn_clone() {
