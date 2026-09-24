@@ -1,14 +1,21 @@
 [Unit]
 Description=gost
 After=network-online.target
-Wants=network-online.target systemd-networkd-wait-online.service
+# 原来这里还 Wants 了 systemd-networkd-wait-online.service，已移除：
+# 那个服务会等所有网卡进入 online 状态，很多 VPS 上要等 90 秒以上、甚至永远等不到，
+# 表现就是 `systemctl restart gost` 长时间卡住不动（实测踩过）。
+# 只留 network-online.target 做启动顺序即可；万一启动时网络还没好，
+# 下面有 Restart=always / RestartSec=5，5 秒后会自动重试，不影响最终可用。
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 Restart=always
 RestartSec=5
-DynamicUser=true
+# DynamicUser=true 原本在这里，已移除：
+# 它和上面的 User=root 是冲突的（systemd 会报凭据错误、还要额外分配动态用户），
+# 而 gost 要绑定特权端口、必须跑在 root 下，所以这两行只能留一行 —— 留 User=root。
 ExecStart=/usr/bin/gost -C /etc/gost/config.json
 
 [Install]

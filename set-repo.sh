@@ -112,13 +112,22 @@ for f in README.md frp-panel/README.md Multi-EasyGost/README.md Multi-EasyGost/g
 done
 info "已备份到 $BACKUP（改坏了可以从这里恢复）"
 
-# 统一的替换函数（用 | 作分隔符，避免和路径里的 / 打架）
+# 统一的替换函数：用 python 做纯文本替换，避免 sed 对特殊字符的转义问题。
+#   用法: sub <文件> <原文> <新文> [<已完成标志>]
+#   给了标志时：文件里已含该标志就跳过 —— 用来保证重复运行是幂等的。
+#   为什么需要：像 "cd frp-panel" → "cd 仓库名/frp-panel" 这种替换，
+#   结果本身又以 "cd frp-panel" 开头，再跑一遍就会叠加成
+#   "cd 仓库名/仓库名/frp-panel"（实测踩过，而且是推上去之后才发现的）。
 sub() {
-  local file="$1" from="$2" to="$3"
+  local file="$1" from="$2" to="$3" done_marker="${4:-}"
   [ -f "$file" ] || return 0
-  # 先判断文件里到底有没有，避免 sed 无谓地重写文件
+  # 已经改过了就别再改，避免把仓库名叠两遍
+  if [ -n "$done_marker" ] && grep -qF -- "$done_marker" "$file" 2>/dev/null; then
+    return 0
+  fi
+  # 先判断文件里到底有没有，避免无谓地重写文件
   if grep -qF -- "$from" "$file" 2>/dev/null; then
-    # 用 python 做替换，避免 sed 对特殊字符的转义问题（都是纯文本，不需要正则）
+    # 用 python 替换（纯文本，不需要正则）
     python - "$file" "$from" "$to" <<'PY'
 import sys
 path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -156,11 +165,25 @@ if [ -f "frp-panel/README.md" ]; then
   sub "frp-panel/README.md" "https://ghfast.top/https://github.com/ychenfen/frp-panel.git" "https://ghfast.top/$REPO_HTTPS"
   sub "frp-panel/README.md" "https://gh-proxy.com/https://github.com/ychenfen/frp-panel.git" "https://gh-proxy.com/$REPO_HTTPS"
   sub "frp-panel/README.md" "https://github.com/ychenfen/frp-panel.git" "$REPO_HTTPS"
-  if [ "$FLAT_FRP" = "1" ]; then
-    sub "frp-panel/README.md" "cd frp-panel" "cd $REPO_NAME"
-  else
-    sub "frp-panel/README.md" "cd frp-panel" "cd $REPO_NAME/frp-panel"
-  fi
+
+  # 把 "cd xxx/frp-panel" 统一成 "cd <仓库名>/frp-panel"。
+  # 用正则而不是纯文本替换，是因为纯文本会出两种问题（都实测踩过）：
+  #   1) 结果本身以 "cd frp-panel" 开头，再跑一遍会叠成 "cd 仓库名/仓库名/frp-panel"
+  #   2) 换一个仓库名再跑时，"cd 旧名/frp-panel" 匹配不上 "cd frp-panel"，改名不生效
+  # 正则里的 (?:[A-Za-z0-9._-]+/)* 允许中间夹任意多段旧仓库名，两种情况都能归一化。
+  python - "frp-panel/README.md" "$REPO_NAME" "$FLAT_FRP" <<'PY'
+import re, sys
+path, repo, flat = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, 'r', encoding='utf-8', newline='') as f:
+    s = f.read()
+new = ('cd ' + repo) if flat == '1' else ('cd ' + repo + '/frp-panel')
+s2 = re.sub(r'cd (?:[A-Za-z0-9._-]+/)*frp-panel', new, s)
+if s2 != s:
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        f.write(s2)
+    print("      · frp-panel/README.md ：归一化 cd 路径 -> " + new)
+PY
+
   sub "frp-panel/README.md" "https://raw.githubusercontent.com/ychenfen/frp-panel/main/scripts/install_frp.sh" "$FRP_RAW_PREFIX/scripts/install_frp.sh"
 fi
 

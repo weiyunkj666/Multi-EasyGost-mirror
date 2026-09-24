@@ -119,6 +119,32 @@ if [ -z "${GHCN_PROXY:-}" ]; then
   unset _ghcn_saved 2>/dev/null || true
 fi
 
+# ---------------------------------------------------------------------------
+# 稳妥地"重启 gost"，避免脚本卡在这一步不动。
+#   为什么不能直接用 `systemctl restart gost`：
+#   gost.service 里写了 Wants=network-online.target systemd-networkd-wait-online.service，
+#   而 systemd-networkd-wait-online.service 是出了名的"会等很久" —— 它要等所有网卡
+#   进入 online 状态，很多 VPS 上要 90 秒以上、甚至永远等不到，
+#   表现就是脚本卡在这一行（实测在你服务器上遇到过）。
+#   这里加 25 秒超时，超时就改用 --no-block：提交任务后立刻返回，服务照样会在后台起来。
+# ---------------------------------------------------------------------------
+ghcn_gost_restart() {
+  # daemon-reload 本身也可能卡（systemd 正忙时），所以一样要加超时保护
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 15 systemctl daemon-reload >/dev/null 2>&1 || true
+  else
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    if timeout 25 systemctl restart gost; then
+      return 0
+    fi
+    echo -e "${Error} 等 systemd 超过 25 秒，已改用不等待的方式重新触发（服务会在后台起来）"
+  fi
+  systemctl --no-block restart gost 2>/dev/null || systemctl restart gost
+  return 0
+}
+
 # 兜底：什么都没取到时用空串。
 # 空串的含义是"用户还没明确选过反代"，所以安装时会弹清单让用户挑；
 # 非交互场景（GHCN_NO_PROMPT=1，或 stdin 不是终端）下，空串就等于直连 GitHub。
@@ -143,7 +169,7 @@ function checknew() {
     Install_ct
     rm -rf /etc/gost
     mv /tmp/gost /etc/
-    systemctl restart gost
+    ghcn_gost_restart
   else
     exit 0
   fi
@@ -237,7 +263,11 @@ function Install_ct() {
   wget --no-check-certificate -O gost.service "${GHCN_PROXY}${SELF_REPO_RAW}/gost.service" && chmod -R 777 gost.service && mv gost.service /usr/lib/systemd/system
   mkdir /etc/gost && wget --no-check-certificate -O config.json "${GHCN_PROXY}${SELF_REPO_RAW}/config.json" && mv config.json /etc/gost && chmod -R 777 /etc/gost
 
-  systemctl enable gost && systemctl restart gost
+  echo -e "正在启用并启动 gost 服务..."
+  echo -e "（gost.service 声明的依赖会让 systemd 等“网络就绪”，有些机器要等很久；"
+  echo -e "  这里最多等 25 秒，超时就改用后台不等待方式，不会一直卡住）"
+  systemctl enable gost >/dev/null 2>&1 || true
+  ghcn_gost_restart
   echo "------------------------------"
   if test -a /usr/bin/gost -a /usr/lib/systemctl/gost.service -a /etc/gost/config.json; then
     echo "gost安装成功"
@@ -272,7 +302,7 @@ function Restart_ct() {
   confstart
   writeconf
   conflast
-  systemctl restart gost
+  ghcn_gost_restart
   echo "已重读配置并重启"
 }
 function read_protocol() {
@@ -1069,7 +1099,7 @@ case "$num" in
   confstart
   writeconf
   conflast
-  systemctl restart gost
+  ghcn_gost_restart
   echo -e "配置已生效，当前配置如下"
   echo -e "--------------------------------------------------------"
   show_all_conf
@@ -1086,7 +1116,7 @@ case "$num" in
     confstart
     writeconf
     conflast
-    systemctl restart gost
+    ghcn_gost_restart
     echo -e "配置已删除，服务已重启"
   else
     echo "请输入正确数字"
