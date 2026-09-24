@@ -1,0 +1,11 @@
+# set-repo.sh 生成的备份目录（改错了可以从里面恢复）
+.set-repo-backup-*/
+
+# 打包产物
+*.zip
+
+# 临时文件
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
